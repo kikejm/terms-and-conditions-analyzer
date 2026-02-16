@@ -1,169 +1,211 @@
 import streamlit as st
 import os
 import tempfile
+from typing import Optional, Dict, Any
+
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
+from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace, HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough, Runnable
+from langchain_core.vectorstores import VectorStore
 
-# --- CONFIGURACIÓN UI ---
-st.set_page_config(page_title="T&C Auditor (LCEL)", page_icon="⚖️", layout="wide")
+# --- CONSTANTES ---
+PAGE_TITLE = "T&C Auditor"
+PAGE_ICON = "⚖️"
 
+MODEL_REPO_ID = "mistralai/Mistral-7B-Instruct-v0.2"
+EMBEDDING_MODEL_ID = "all-MiniLM-L6-v2"
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 50
+
+AUDIT_TOPICS = {
+    "privacy": {"q": "Resume las políticas de privacidad, recolección de datos y GDPR. Sé conciso.", "icon": "🔒", "type": "info"},
+    "jurisdiction": {"q": "¿Cuál es la jurisdicción, tribunales competentes y ley aplicable? Sé conciso.", "icon": "⚖️", "type": "warning"},
+    "termination": {"q": "¿Condiciones para terminar el contrato y penalizaciones? Sé conciso.", "icon": "🚫", "type": "success"}
+}
+
+# CORRECCIÓN CSS: Se añade 'color: #31333F' para forzar texto oscuro sobre fondo blanco
 CUSTOM_CSS = """
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
     html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+    
     .audit-card {
-        padding: 1rem; border-radius: 8px; margin-bottom: 1rem;
-        border-left: 4px solid; background-color: #fdfdfd; box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        padding: 1.5rem; 
+        border-radius: 8px; 
+        margin-bottom: 1rem;
+        border-left: 5px solid; 
+        background-color: #ffffff; 
+        color: #31333F !important; /* Texto oscuro obligatorio */
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    }
+    .audit-card h4 {
+        margin-top: 0;
+        color: #000000;
+        font-weight: 600;
     }
     .audit-info { border-color: #2196f3; }
     .audit-warning { border-color: #ff9800; }
     .audit-success { border-color: #4caf50; }
 </style>
 """
+
+# --- CONFIGURACIÓN ---
+st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# --- ESTADO ---
-if "messages" not in st.session_state: st.session_state.messages = []
-if "vector_store" not in st.session_state: st.session_state.vector_store = None
-if "audit_results" not in st.session_state: st.session_state.audit_results = {}
+# --- LÓGICA ---
 
-# --- FUNCIONES DE AYUDA LCEL ---
+@st.cache_resource
+def get_embeddings_model():
+    return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_ID)
+
+@st.cache_resource
+def get_chat_model(hf_token: str):
+    if not hf_token:
+        raise ValueError("Token no proporcionado.")
+    
+    llm = HuggingFaceEndpoint(
+        repo_id=MODEL_REPO_ID,
+        huggingfacehub_api_token=hf_token,
+        temperature=0.1,
+        max_new_tokens=512,
+        timeout=120,
+    )
+    
+    return ChatHuggingFace(llm=llm)
+
 def format_docs(docs):
-    """Función auxiliar para unir los documentos recuperados en un solo string."""
     return "\n\n".join(doc.page_content for doc in docs)
 
-def get_llm(hf_token):
-    return HuggingFaceEndpoint(
-        repo_id="mistralai/Mistral-7B-Instruct-v0.3",
-        temperature=0.01,
-        huggingfacehub_api_token=hf_token
-    )
-
-def process_file(uploaded_file, hf_token):
-    if not hf_token: return None
+def create_rag_chain(vector_store: VectorStore, chat_model: Any, k: int = 3) -> Runnable:
+    retriever = vector_store.as_retriever(search_kwargs={"k": k})
     
-    with st.status("⚙️ Indexando documento...", expanded=True) as status:
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp:
-                tmp.write(uploaded_file.getvalue())
-                tmp_path = tmp.name
-            
-            loader = PyPDFLoader(tmp_path) if uploaded_file.name.endswith('.pdf') else TextLoader(tmp_path)
-            docs = loader.load()
-            
-            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-            splits = splitter.split_documents(docs)
-            
-            embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-            vector_store = FAISS.from_documents(splits, embeddings)
-            
-            os.remove(tmp_path)
-            status.update(label="✅ Listo", state="complete", expanded=False)
-            return vector_store
-        except Exception as e:
-            st.error(f"Error: {e}")
-            return None
-
-def run_audit(vector_store, hf_token):
-    """Auditoría usando LCEL puro (Sin RetrievalQA)."""
-    llm = get_llm(hf_token)
-    retriever = vector_store.as_retriever(search_kwargs={"k": 2})
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Eres un abogado experto revisando contratos (T&C). Responde basándote ÚNICAMENTE en el contexto proporcionado en español. Si no se menciona, dilo explícitamente."),
+        ("human", "Contexto:\n{context}\n\nPregunta: {question}")
+    ])
     
-    # 1. Definir Prompt
-    template = """[INST] Analiza el siguiente contexto legal y responde la pregunta.
-    Contexto: {context}
-    Pregunta: {question} [/INST]"""
-    prompt = PromptTemplate.from_template(template)
-    
-    # 2. Construir la Cadena (LCEL Pipe)
-    # Retriever -> Formatear -> Prompt -> LLM -> Parser Texto
-    rag_chain = (
+    return (
         {"context": retriever | format_docs, "question": RunnablePassthrough()}
         | prompt
-        | llm
+        | chat_model
         | StrOutputParser()
     )
+
+def process_uploaded_file(uploaded_file) -> Optional[VectorStore]:
+    if not uploaded_file: return None
     
-    audit_topics = {
-        "privacy": {"q": "Resume políticas de privacidad y GDPR.", "icon": "🔒", "type": "info"},
-        "jurisdiction": {"q": "¿Cuál es la jurisdicción y ley aplicable?", "icon": "⚖️", "type": "warning"},
-        "termination": {"q": "¿Cómo se puede terminar el contrato?", "icon": "🚫", "type": "success"}
-    }
-    
+    suffix = f".{uploaded_file.name.split('.')[-1]}"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_path = tmp_file.name 
+
+    try:
+        loader = PyPDFLoader(tmp_path) if uploaded_file.name.endswith('.pdf') else TextLoader(tmp_path, encoding='utf-8')
+        docs = loader.load()
+        splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        splits = splitter.split_documents(docs)
+        embeddings = get_embeddings_model()
+        vector_store = FAISS.from_documents(splits, embeddings)
+        return vector_store
+    except Exception as e:
+        st.error(f"Error procesando archivo: {e}")
+        return None
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+def perform_audit(vector_store: VectorStore, chat_model: Any) -> Dict[str, Any]:
+    rag_chain = create_rag_chain(vector_store, chat_model, k=3)
     results = {}
-    bar = st.progress(0)
+    progress_bar = st.progress(0)
     
-    for i, (key, val) in enumerate(audit_topics.items()):
+    for i, (key, config) in enumerate(AUDIT_TOPICS.items()):
         try:
-            # .invoke() es el método estándar de LCEL
-            response = rag_chain.invoke(val["q"])
-            results[key] = {"content": response, "icon": val["icon"], "type": val["type"]}
+            response = rag_chain.invoke(config["q"])
+            results[key] = {
+                "content": response, 
+                "icon": config["icon"], 
+                "type": config["type"],
+                "title": key.capitalize()
+            }
         except Exception as e:
-            results[key] = {"content": "Error en la consulta.", "icon": "⚠️", "type": "warning"}
-        bar.progress((i + 1) / 3)
+            results[key] = {
+                "content": f"Error técnico: {repr(e)}", 
+                "icon": "⚠️", 
+                "type": "warning",
+                "title": key.capitalize()
+            }
+        progress_bar.progress((i + 1) / len(AUDIT_TOPICS))
     
-    bar.empty()
+    progress_bar.empty()
     return results
 
-# --- MAIN ---
+# --- UI ---
+
 def main():
-    st.title("🛡️ Auditor Legal (LCEL)")
+    if "messages" not in st.session_state: st.session_state.messages = []
+    if "vector_store" not in st.session_state: st.session_state.vector_store = None
+    if "audit_results" not in st.session_state: st.session_state.audit_results = {}
+
+    st.title(f"{PAGE_ICON} {PAGE_TITLE}")
     
     with st.sidebar:
-        hf_token = st.text_input("HF Token", type="password")
-        uploaded_file = st.file_uploader("Archivo", type=["pdf", "txt"])
-        if st.button("Procesar") and uploaded_file:
-            st.session_state.vector_store = process_file(uploaded_file, hf_token)
-            if st.session_state.vector_store:
-                st.session_state.audit_results = run_audit(st.session_state.vector_store, hf_token)
+        st.header("Configuración")
+        hf_token = st.text_input("HuggingFace Token", type="password")
+        uploaded_file = st.file_uploader("Subir Contrato", type=["pdf", "txt"])
+        
+        if st.button("Auditar Documento", type="primary") and uploaded_file and hf_token:
+            with st.spinner("⏳ Analizando..."):
+                try:
+                    _ = get_embeddings_model()
+                    chat_model = get_chat_model(hf_token)
+                    vs = process_uploaded_file(uploaded_file)
+                    
+                    if vs:
+                        st.session_state.vector_store = vs
+                        st.session_state.audit_results = perform_audit(vs, chat_model)
+                        st.success("¡Análisis completado!")
+                except Exception as e:
+                    st.error(f"Error de conexión: {e}")
 
-    tab1, tab2 = st.tabs(["Resultados", "Chat"])
+    tab1, tab2 = st.tabs(["📊 Resultados", "💬 Chat"])
     
     with tab1:
         if st.session_state.audit_results:
-            cols = st.columns(3)
-            idx = 0
-            for key, res in st.session_state.audit_results.items():
-                with cols[idx]:
-                    st.markdown(f"""
-                    <div class="audit-card audit-{res['type']}">
-                        <h4>{res['icon']} {key.capitalize()}</h4>
-                        <small>{res['content']}</small>
-                    </div>
-                    """, unsafe_allow_html=True)
-                idx = (idx + 1) % 3
+            # CORRECCIÓN LAYOUT: Eliminado st.columns(3) en favor de vista vertical completa
+            for res in st.session_state.audit_results.values():
+                st.markdown(f"""
+                <div class="audit-card audit-{res['type']}">
+                    <h4>{res['icon']} {res['title']}</h4>
+                    <div>{res['content']}</div>
+                </div>""", unsafe_allow_html=True)
+        else:
+            st.info("Sube un archivo para comenzar.")
 
     with tab2:
         for msg in st.session_state.messages:
             st.chat_message(msg["role"]).markdown(msg["content"])
-            
-        if prompt_text := st.chat_input("Pregunta..."):
-            if st.session_state.vector_store:
-                st.session_state.messages.append({"role": "user", "content": prompt_text})
-                st.chat_message("user").markdown(prompt_text)
-                
-                # Cadena para Chat (LCEL)
-                llm = get_llm(hf_token)
-                retriever = st.session_state.vector_store.as_retriever(search_kwargs={"k": 3})
-                template = "[INST] Contexto: {context}. Pregunta: {question} [/INST]"
-                prompt_obj = PromptTemplate.from_template(template)
-                
-                chat_chain = (
-                    {"context": retriever | format_docs, "question": RunnablePassthrough()}
-                    | prompt_obj
-                    | llm
-                    | StrOutputParser()
-                )
-                
-                with st.spinner("Pensando..."):
-                    resp = chat_chain.invoke(prompt_text)
-                    st.chat_message("assistant").markdown(resp)
-                    st.session_state.messages.append({"role": "assistant", "content": resp})
+        
+        if prompt := st.chat_input("Pregunta sobre el contrato..."):
+            if not st.session_state.vector_store:
+                st.error("Sube un archivo primero.")
+            else:
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                st.chat_message("user").markdown(prompt)
+                try:
+                    chat_model = get_chat_model(hf_token)
+                    chain = create_rag_chain(st.session_state.vector_store, chat_model)
+                    with st.spinner("Pensando..."):
+                        resp = chain.invoke(prompt)
+                        st.chat_message("assistant").markdown(resp)
+                        st.session_state.messages.append({"role": "assistant", "content": resp})
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,4 @@
 streamlit
-langchain
 langchain-core
 langchain-community
 langchain-huggingface
@@ -8,4 +7,3 @@ faiss-cpu
 pypdf
 huggingface-hub
 sentence-transformers
-tiktoken
