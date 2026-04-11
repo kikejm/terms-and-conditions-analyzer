@@ -16,7 +16,7 @@ from langchain_core.vectorstores import VectorStore
 PAGE_TITLE = "T&C Auditor"
 PAGE_ICON = "⚖️"
 
-MODEL_REPO_ID = "mistralai/Mistral-7B-Instruct-v0.2"
+MODEL_REPO_ID = "mistralai/Mistral-7B-Instruct-v0.3"
 EMBEDDING_MODEL_ID = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
@@ -27,7 +27,6 @@ AUDIT_TOPICS = {
     "termination": {"q": "¿Condiciones para terminar el contrato y penalizaciones? Sé conciso.", "icon": "🚫", "type": "success"}
 }
 
-# CORRECCIÓN CSS: Se añade 'color: #31333F' para forzar texto oscuro sobre fondo blanco
 CUSTOM_CSS = """
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
@@ -70,6 +69,7 @@ def get_chat_model(hf_token: str):
     
     llm = HuggingFaceEndpoint(
         repo_id=MODEL_REPO_ID,
+        task="text-generation",
         huggingfacehub_api_token=hf_token,
         temperature=0.1,
         max_new_tokens=512,
